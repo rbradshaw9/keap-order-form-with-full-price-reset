@@ -299,7 +299,7 @@
     return trigger;
   }
 
-  function removeTurboPackFromCart() {
+  function removeTurboPackFromCart(forceRemove = false) {
     const inCart = turboPackIsInCart();
     const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
     
@@ -317,9 +317,13 @@
       });
     }
     
-    if (!inCart) {
+    if (!inCart && !forceRemove) {
       logDebug('Turbo Pack not detected in cart, skipping removal');
       return;
+    }
+
+    if (!inCart && forceRemove) {
+      logDebug('Turbo Pack not detected in cart, forcing removal attempt via ajax/trigger');
     }
     
     if (isRemovingTurboPack) {
@@ -401,7 +405,7 @@
       // Add a delay to let Keap's AJAX finish updating the cart before we check for Turbo Pack
       window.setTimeout(() => {
         logDebug('Delayed Turbo Pack removal check (after 200ms)');
-        removeTurboPackFromCart();
+        removeTurboPackFromCart(true);
       }, 200);
     } else {
       logDebug('✓ Single pay NOT selected → Showing upsells (Turbo Pack can be added)');
