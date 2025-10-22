@@ -1,0 +1,531 @@
+<script>
+(function () {
+  'use strict';
+
+  const DEBUG = true;
+
+  const CONFIG = {
+    SINGLE_PAY_PRICE: '$1,997',
+    SINGLE_PAY_VALUES: ['0']
+  };
+
+  const TURBO_PRODUCT_ID = '5';  // Updated to correct product ID
+  const TURBO_UPDATE_TARGETS = [
+    'ORDER_FORM_PRODUCT_LIST',
+    'ORDER_FORM_BILLING_ENTRY',
+    'ORDER_FORM_SUMMARY',
+    'UP_SELLS',
+    'PAYMENT_PLANS',
+    'PAYMENT_SELECTION',
+    'ORDER_FORM_SHIPPING_ENTRY',
+    'SHIPPING_OPTIONS',
+    'CHECKOUT_LINKS'
+  ];
+
+  const raf = window.requestAnimationFrame
+    ? window.requestAnimationFrame.bind(window)
+    : (cb) => window.setTimeout(cb, 16);
+
+  const $ = (selector, root) => (root || document).querySelector(selector);
+  const $$ = (selector, root) => Array.from((root || document).querySelectorAll(selector));
+
+  let updateScheduled = false;
+  let turboAddWrapperCache = null;
+  let isRemovingTurboPack = false;
+  let lastRemovalTime = 0;
+
+  function logDebug() {
+    if (!DEBUG) return;
+    const args = Array.prototype.slice.call(arguments);
+    args.unshift('[SinglePayDebug]');
+    console.log.apply(console, args);
+  }
+
+  function scheduleUpdate() {
+    if (updateScheduled) return;
+    updateScheduled = true;
+    logDebug('scheduleUpdate invoked');
+    raf(() => {
+      updateScheduled = false;
+      logDebug('scheduleUpdate running initialize');
+      initialize();
+    });
+  }
+
+
+
+  function getPaymentRadios() {
+    return $$('input[type="radio"][name="payPlanId"], input[type="radio"][name*="payPlan"], input[type="radio"][name*="payment"]');
+  }
+
+  function getLabelForInput(input) {
+    if (!input) return null;
+    if (input.id) {
+      const explicitLabel = $(`label[for="${input.id}"]`);
+      if (explicitLabel) return explicitLabel;
+    }
+    return input.closest('label');
+  }
+
+  function findSinglePayRadio() {
+    const radios = getPaymentRadios();
+    logDebug('Evaluating payment radios', radios.length);
+    
+    // Filter to ONLY payment plan radios (not payment type like creditcard/paypal)
+    const payPlanRadios = radios.filter((radio) => radio.name === 'payPlanId');
+    
+    // Log all radio values for debugging
+    radios.forEach((radio, index) => {
+      const label = getLabelForInput(radio);
+      logDebug(`Radio ${index}: value="${radio.value}", name="${radio.name}", checked=${radio.checked}, label="${label ? label.textContent.trim().substring(0, 50) : 'N/A'}"`);
+    });
+
+    // First try to find by "SINGLE PAYMENT" text in label - only check payment plan radios
+    for (const radio of payPlanRadios) {
+      const label = getLabelForInput(radio);
+      if (label && label.textContent && label.textContent.toUpperCase().includes('SINGLE PAYMENT')) {
+        logDebug('Single pay matched by label text', label.textContent.trim(), 'value:', radio.value);
+        return { radio, label };
+      }
+    }
+
+    // Then try to match by configured value - only check payment plan radios
+    for (const value of CONFIG.SINGLE_PAY_VALUES) {
+      const match = payPlanRadios.find((radio) => (radio.value || '').trim() === value);
+      if (match) {
+        const label = getLabelForInput(match);
+        if (label) {
+          logDebug('Single pay matched by value', value);
+          return { radio: match, label };
+        }
+      }
+    }
+
+    // Fallback: use first PAYMENT PLAN radio (not first radio overall)
+    const fallbackRadio = payPlanRadios[0];
+    if (fallbackRadio) {
+      const label = getLabelForInput(fallbackRadio);
+      if (label) {
+        logDebug('Using fallback radio (first payment plan radio)');
+        return { radio: fallbackRadio, label };
+      }
+    }
+
+    return null;
+  }
+
+  let priceObserver = null;
+  let priceUpdateCount = 0;
+
+  function applySinglePayPrice(single) {
+    const { label } = single;
+    
+    logDebug('=== applySinglePayPrice called ===');
+    logDebug('  Label element:', label);
+    logDebug('  Label text:', label.textContent.trim().substring(0, 100));
+    
+    // Find price text in the label and replace it with $1,997
+    const priceRegex = /\$[\d,]+(?:\.\d{2})?/;
+    
+    const updatePrice = (source) => {
+      priceUpdateCount++;
+      logDebug(`[Price Update #${priceUpdateCount}] Source: ${source || 'unknown'}`);
+      
+      const walker = document.createTreeWalker(label, NodeFilter.SHOW_TEXT, null, false);
+      let node;
+      let updated = false;
+      
+      while (node = walker.nextNode()) {
+        if (priceRegex.test(node.textContent)) {
+          const currentPrice = node.textContent.match(priceRegex)[0];
+          logDebug(`  Current price in label: ${currentPrice}`);
+          logDebug(`  Target price: ${CONFIG.SINGLE_PAY_PRICE}`);
+          logDebug(`  Needs update: ${currentPrice !== CONFIG.SINGLE_PAY_PRICE}`);
+          
+          if (currentPrice !== CONFIG.SINGLE_PAY_PRICE) {
+            const oldText = node.textContent;
+            node.textContent = node.textContent.replace(priceRegex, CONFIG.SINGLE_PAY_PRICE);
+            logDebug(`  ✓ Updated price from ${currentPrice} to ${CONFIG.SINGLE_PAY_PRICE}`);
+            logDebug(`  Full text changed from: "${oldText}"`);
+            logDebug(`  Full text changed to: "${node.textContent}"`);
+            updated = true;
+          } else {
+            logDebug(`  ✓ Price already correct at ${CONFIG.SINGLE_PAY_PRICE}`);
+          }
+          break;
+        }
+      }
+      
+      if (!updated) {
+        logDebug('  No price update needed or no price found');
+      }
+      
+      return updated;
+    };
+    
+    // Initial price update
+    logDebug('Performing initial price update...');
+    updatePrice('initial');
+    
+    // Disconnect existing observer if any
+    if (priceObserver) {
+      logDebug('Disconnecting existing price observer');
+      priceObserver.disconnect();
+    }
+    
+    // Set up observer to keep price locked at $1,997
+    if (window.MutationObserver) {
+      priceObserver = new MutationObserver((mutations) => {
+        logDebug(`Price observer triggered by ${mutations.length} mutation(s)`);
+        mutations.forEach((mutation, index) => {
+          logDebug(`  Mutation ${index + 1}: type=${mutation.type}, target=`, mutation.target);
+          if (mutation.type === 'characterData') {
+            logDebug(`    Old value: "${mutation.oldValue}"`);
+            logDebug(`    New value: "${mutation.target.textContent}"`);
+          }
+        });
+        updatePrice('observer');
+      });
+      priceObserver.observe(label, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        characterDataOldValue: true
+      });
+      logDebug('✓ Price observer attached to lock price at', CONFIG.SINGLE_PAY_PRICE);
+    }
+  }
+
+  function isTurboAddButton(element) {
+    const text = element.textContent || '';
+    if (!/add to order/i.test(text)) return false;
+
+    const href = element.getAttribute('href') || '';
+    if (href.includes(`'${TURBO_PRODUCT_ID}'`)) return true;
+
+    const context = (element.closest('[class*="upsell" i], .spiffy-upsell, .infusion-option, tr, li, div, section, article') || element.parentElement || element).textContent || '';
+    return /turbo pack/i.test(context);
+  }
+
+  function findUpsellSections() {
+    const sections = [];
+    
+    // Find the entire UP_SELLS section by ID
+    const upSellRoot = document.getElementById('UP_SELLS');
+    if (upSellRoot) {
+      sections.push(upSellRoot);
+      logDebug('Found UP_SELLS section by ID');
+    }
+    
+    logDebug('findUpsellSections found', sections.length, 'section(s)');
+    return sections;
+  }
+
+  function setUpsellVisibility(isVisible) {
+    const sections = findUpsellSections();
+    logDebug('setUpsellVisibility setting', isVisible ? 'visible' : 'hidden', 'for', sections.length, 'sections');
+    
+    if (!sections.length) {
+      logDebug('WARNING: No upsell sections found!');
+      return;
+    }
+
+    sections.forEach((section) => {
+      if (isVisible) {
+        // Show the element - remove display:none if present
+        if (section.style.display === 'none') {
+          section.style.display = '';
+        }
+      } else {
+        // Hide the element
+        section.style.display = 'none';
+      }
+    });
+  }
+
+  function turboPackIsInCart() {
+    const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
+    if (!productList) {
+      logDebug('turboPackIsInCart: ORDER_FORM_PRODUCT_LIST not found');
+      return false;
+    }
+    
+    // Check both by text content and by product ID in links
+    const rows = Array.from(productList.querySelectorAll('tr'));
+    const foundByText = rows.some((row) => /turbo pack/i.test(row.textContent || ''));
+    const foundById = rows.some((row) => {
+      const links = row.querySelectorAll('a[href*="ajaxSubmitForm"]');
+      return Array.from(links).some(link => {
+        const href = link.getAttribute('href') || '';
+        return href.includes(`'${TURBO_PRODUCT_ID}'`);
+      });
+    });
+    
+    const inCart = foundByText || foundById;
+    logDebug(`turboPackIsInCart: ${inCart} (foundByText: ${foundByText}, foundById: ${foundById})`);
+    return inCart;
+  }
+
+  function findTurboRemoveTrigger() {
+    const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
+    if (!productList) {
+      logDebug('findTurboRemoveTrigger: ORDER_FORM_PRODUCT_LIST not found');
+      return null;
+    }
+
+    const trigger = Array.from(productList.querySelectorAll('a[href*="ajaxSubmitForm"], button')).find((el) => {
+      const text = el.textContent || '';
+      const href = el.getAttribute('href') || '';
+      const isRemoveLink = /remove/i.test(text);
+      const hasTurboId = href.includes(`'${TURBO_PRODUCT_ID}'`);
+      
+      if (isRemoveLink && hasTurboId) {
+        logDebug('findTurboRemoveTrigger: Found remove link', { text, productId: TURBO_PRODUCT_ID });
+        return true;
+      }
+      return false;
+    }) || null;
+    
+    if (!trigger) {
+      logDebug('findTurboRemoveTrigger: No remove link found for product ID', TURBO_PRODUCT_ID);
+    }
+    return trigger;
+  }
+
+  function removeTurboPackFromCart() {
+    const inCart = turboPackIsInCart();
+    const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
+    
+    logDebug('removeTurboPackFromCart called');
+    logDebug('  - inCart:', inCart);
+    logDebug('  - isRemoving:', isRemovingTurboPack);
+    logDebug('  - productList exists:', Boolean(productList));
+    
+    if (productList) {
+      const rows = productList.querySelectorAll('tr');
+      logDebug('  - cart has', rows.length, 'rows');
+      rows.forEach((row, i) => {
+        const text = row.textContent || '';
+        logDebug('    Row', i + ':', text.substring(0, 80));
+      });
+    }
+    
+    if (!inCart) {
+      logDebug('Turbo Pack not detected in cart, skipping removal');
+      return;
+    }
+    
+    if (isRemovingTurboPack) {
+      logDebug('Already removing Turbo Pack, skipping');
+      return;
+    }
+
+    logDebug('Attempting to remove Turbo Pack from cart');
+
+    const identifierInput = $('#identifier');
+    const identifier = identifierInput ? identifierInput.value : '';
+    const removeTrigger = findTurboRemoveTrigger();
+    const canCallAjax = Boolean(
+      identifier &&
+      window.Infusion &&
+      Infusion.Ecomm &&
+      Infusion.Ecomm.OrderForms &&
+      typeof Infusion.Ecomm.OrderForms.ajaxSubmitForm === 'function'
+    );
+
+    isRemovingTurboPack = true;
+    lastRemovalTime = Date.now();
+
+    const releaseLock = () => {
+      window.setTimeout(() => {
+        isRemovingTurboPack = false;
+        logDebug('Removal lock released');
+      }, 2000);
+    };
+
+    try {
+      if (canCallAjax) {
+        logDebug('Removing Turbo Pack via ajaxSubmitForm');
+        Infusion.Ecomm.OrderForms.ajaxSubmitForm(
+          'orderForm',
+          false,
+          TURBO_PRODUCT_ID,
+          0,
+          identifier,
+          'RENDER_ORDER_FORM',
+          TURBO_UPDATE_TARGETS.slice()
+        );
+      } else if (removeTrigger) {
+        logDebug('Falling back to remove trigger click');
+        removeTrigger.click();
+      } else {
+        logDebug('ERROR: No way to remove Turbo Pack found');
+      }
+    } catch (error) {
+      console.error('Turbo Pack removal failed', error);
+    } finally {
+      releaseLock();
+    }
+  }
+
+  function syncTurboPackState(single) {
+    // Check if the single pay radio is actually checked (don't compare objects, check the checked property)
+    const isSingleSelected = Boolean(single && single.radio.checked);
+
+    logDebug('=== syncTurboPackState called ===');
+    logDebug('syncTurboPackState details:', {
+      hasSingle: Boolean(single),
+      singleRadioValue: single ? single.radio.value : null,
+      singleRadioName: single ? single.radio.name : null,
+      singleRadioChecked: single ? single.radio.checked : null,
+      isSingleSelected
+    });
+
+    // Log all currently checked radios
+    const allRadios = getPaymentRadios();
+    const checkedRadios = allRadios.filter(r => r.checked);
+    logDebug(`Currently checked radios (${checkedRadios.length}):`, checkedRadios.map(r => `${r.name}=${r.value}`));
+
+    logDebug(`Setting upsell visibility to: ${!isSingleSelected ? 'VISIBLE' : 'HIDDEN'}`);
+    setUpsellVisibility(!isSingleSelected);
+
+    if (isSingleSelected) {
+      logDebug('✓ Single pay IS selected → Removing Turbo Pack and hiding upsells');
+      removeTurboPackFromCart();
+    } else {
+      logDebug('✓ Single pay NOT selected → Showing upsells (Turbo Pack can be added)');
+    }
+    
+    logDebug('=== syncTurboPackState complete ===');
+  }
+
+  function onRadioChange() {
+    scheduleUpdate();
+  }
+
+  function attachPaymentListeners() {
+    getPaymentRadios().forEach((radio) => {
+      radio.removeEventListener('change', onRadioChange);
+      radio.addEventListener('change', onRadioChange);
+    });
+  }
+
+  // Override Keap's unhideOrderFormSections to prevent it from re-showing hidden sections
+  function overrideKeapUnhide() {
+    if (window.Infusion && Infusion.Ecomm && Infusion.Ecomm.OrderForms) {
+      const original = Infusion.Ecomm.OrderForms.unhideOrderFormSections;
+      Infusion.Ecomm.OrderForms.unhideOrderFormSections = function() {
+        logDebug('Intercepted unhideOrderFormSections call');
+        if (original) {
+          original.apply(this, arguments);
+        }
+        // Re-apply our visibility logic after Keap tries to unhide
+        window.setTimeout(() => {
+          const single = findSinglePayRadio();
+          if (single && single.radio.checked) {
+            logDebug('Re-hiding upsells after unhideOrderFormSections');
+            setUpsellVisibility(false);
+          }
+        }, 50);
+      };
+      logDebug('Overrode unhideOrderFormSections');
+    }
+  }
+
+  function initialize() {
+    logDebug('═══════════════════════════════════════');
+    logDebug('    INITIALIZE CALLED');
+    logDebug('═══════════════════════════════════════');
+    
+    const single = findSinglePayRadio();
+    logDebug('initialize results:', { 
+      hasSingle: Boolean(single),
+      singleValue: single ? single.radio.value : null,
+      singleChecked: single ? single.radio.checked : null
+    });
+    
+    if (single) {
+      logDebug('Applying price lock to single pay option...');
+      applySinglePayPrice(single);
+    } else {
+      logDebug('WARNING: No single pay radio found, skipping price application');
+    }
+
+    logDebug('Attaching payment listeners...');
+    attachPaymentListeners();
+    
+    logDebug('Syncing Turbo Pack state...');
+    syncTurboPackState(single);
+    
+    logDebug('═══════════════════════════════════════');
+    logDebug('    INITIALIZE COMPLETE');
+    logDebug('═══════════════════════════════════════');
+  }
+
+  // Run override early
+  overrideKeapUnhide();
+
+  function shouldReactToMutation(mutation) {
+    // Don't react to mutations shortly after removing Turbo Pack to avoid interference
+    const timeSinceRemoval = Date.now() - lastRemovalTime;
+    if (timeSinceRemoval < 1500) {
+      // logDebug('Ignoring mutation - too soon after removal (' + timeSinceRemoval + 'ms)'); // Too noisy
+      return false;
+    }
+
+    if (mutation.type === 'childList') {
+      const changedNodes = [
+        ...Array.from(mutation.addedNodes || []),
+        ...Array.from(mutation.removedNodes || [])
+      ];
+      const shouldReact = changedNodes.some((node) => {
+        if (!(node instanceof Element)) return false;
+        if (node.matches('input[type="radio"]')) return true;
+        if (node.querySelector && node.querySelector('input[type="radio"]')) return true;
+        return false;
+      });
+      
+      if (shouldReact) {
+        logDebug('📡 Mutation detected: childList change affecting radio buttons');
+      }
+      return shouldReact;
+    }
+
+    if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+      const shouldReact = mutation.target.matches('input[type="radio"]');
+      if (shouldReact) {
+        logDebug('📡 Mutation detected: radio button attribute changed', {
+          target: mutation.target,
+          attribute: mutation.attributeName,
+          value: mutation.target.getAttribute(mutation.attributeName)
+        });
+      }
+      return shouldReact;
+    }
+
+    return false;
+  }
+
+  const targetNode = document.getElementById('content') || document.body;
+  const MutationObserverCtor = window.MutationObserver || window.WebKitMutationObserver;
+
+  if (MutationObserverCtor && targetNode) {
+    const observer = new MutationObserverCtor((mutations) => {
+      if (mutations.some(shouldReactToMutation)) {
+        scheduleUpdate();
+      }
+    });
+    observer.observe(targetNode, { childList: true, subtree: true, attributes: true, attributeFilter: ['checked'] });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleUpdate, { once: true });
+  } else {
+    scheduleUpdate();
+  }
+
+  window.addEventListener('load', scheduleUpdate);
+  window.addEventListener('hashchange', scheduleUpdate);
+  window.addEventListener('popstate', scheduleUpdate);
+})();
+</script>
