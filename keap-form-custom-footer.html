@@ -9,7 +9,9 @@
     SINGLE_PAY_VALUES: ['0']
   };
 
-  const TURBO_PRODUCT_ID = '8';  // Turbo Pack product ID from view-source
+  const TURBO_PRODUCT_ID_FALLBACK = '10';  // Fallback Turbo Pack product ID from latest markup
+  let detectedTurboProductId = null;
+  let loggedFallbackProductId = false;
   const TURBO_UPDATE_TARGETS = [
     'ORDER_FORM_PRODUCT_LIST',
     'ORDER_FORM_BILLING_ENTRY',
@@ -203,12 +205,72 @@
     }
   }
 
+  function parseProductIdFromHref(href) {
+    if (!href) return null;
+    const match = href.match(/ajaxSubmitForm\([^,]+,\s*(?:true|false)\s*,\s*['"](\d+)['"]/i);
+    return match ? match[1] : null;
+  }
+
+  function detectTurboProductId() {
+    const roots = [
+      document.getElementById('ORDER_FORM_PRODUCT_LIST'),
+      document.getElementById('UP_SELLS'),
+      document.body
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      const candidates = root.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]');
+      for (const el of candidates) {
+        const text = (el.textContent || '').toLowerCase();
+        const context = ((el.closest('[class*="upsell" i], .spiffy-upsell, .infusion-option, tr, li, div, section, article') || el).textContent || '').toLowerCase();
+        if (!/turbo pack/.test(text) && !/turbo pack/.test(context)) continue;
+
+        const href = el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('onclick') || '';
+        const productId = parseProductIdFromHref(href);
+        if (productId) {
+          if (detectedTurboProductId !== productId) {
+            logDebug('Detected Turbo Pack product ID from DOM:', productId);
+            detectedTurboProductId = productId;
+            loggedFallbackProductId = false;
+          }
+          return productId;
+        }
+      }
+    }
+
+    return detectedTurboProductId;
+  }
+
+  function getTurboProductId() {
+    const detected = detectTurboProductId();
+    if (detected) {
+      return detected;
+    }
+
+    if (!detectedTurboProductId) {
+      detectedTurboProductId = TURBO_PRODUCT_ID_FALLBACK;
+    }
+
+    if (!loggedFallbackProductId && detectedTurboProductId === TURBO_PRODUCT_ID_FALLBACK) {
+      logDebug('Using fallback Turbo Pack product ID:', TURBO_PRODUCT_ID_FALLBACK);
+      loggedFallbackProductId = true;
+    }
+
+    return detectedTurboProductId;
+  }
+
+  function targetContainsProductId(target, productId) {
+    if (!target || !productId) return false;
+    return target.includes(`'${productId}'`) || target.includes(`"${productId}"`);
+  }
+
   function isTurboAddButton(element) {
     const text = element.textContent || '';
     if (!/add to order/i.test(text)) return false;
 
-    const href = element.getAttribute('href') || '';
-    if (href.includes(`'${TURBO_PRODUCT_ID}'`)) return true;
+    const href = element.getAttribute('href') || element.getAttribute('data-href') || element.getAttribute('onclick') || '';
+    const productId = getTurboProductId();
+    if (targetContainsProductId(href, productId)) return true;
 
     const context = (element.closest('[class*="upsell" i], .spiffy-upsell, .infusion-option, tr, li, div, section, article') || element.parentElement || element).textContent || '';
     return /turbo pack/i.test(context);
@@ -260,11 +322,14 @@
     // Check both by text content and by product ID in links
     const rows = Array.from(productList.querySelectorAll('tr'));
     const foundByText = rows.some((row) => /turbo pack/i.test(row.textContent || ''));
+    const productId = getTurboProductId();
     const foundById = rows.some((row) => {
-      const links = row.querySelectorAll('a[href*="ajaxSubmitForm"]');
+      const links = row.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]');
       return Array.from(links).some(link => {
-        const href = link.getAttribute('href') || '';
-        return href.includes(`'${TURBO_PRODUCT_ID}'`);
+        const candidates = ['href', 'data-href', 'onclick']
+          .map((attr) => link.getAttribute(attr))
+          .filter(Boolean);
+        return candidates.some(target => targetContainsProductId(target, productId));
       });
     });
     
@@ -280,21 +345,24 @@
       return null;
     }
 
-    const trigger = Array.from(productList.querySelectorAll('a[href*="ajaxSubmitForm"], button')).find((el) => {
+    const productId = getTurboProductId();
+    const trigger = Array.from(productList.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]')).find((el) => {
       const text = el.textContent || '';
-      const href = el.getAttribute('href') || '';
+      const candidates = ['href', 'data-href', 'onclick']
+        .map((attr) => el.getAttribute(attr))
+        .filter(Boolean);
       const isRemoveLink = /remove/i.test(text);
-      const hasTurboId = href.includes(`'${TURBO_PRODUCT_ID}'`);
+      const hasTurboId = candidates.some(target => targetContainsProductId(target, productId));
       
       if (isRemoveLink && hasTurboId) {
-        logDebug('findTurboRemoveTrigger: Found remove link', { text, productId: TURBO_PRODUCT_ID });
+        logDebug('findTurboRemoveTrigger: Found remove link', { text, productId });
         return true;
       }
       return false;
     }) || null;
     
     if (!trigger) {
-      logDebug('findTurboRemoveTrigger: No remove link found for product ID', TURBO_PRODUCT_ID);
+      logDebug('findTurboRemoveTrigger: No remove link found for product ID', productId);
     }
     return trigger;
   }
@@ -335,6 +403,7 @@
 
     const identifierInput = $('#identifier');
     const identifier = identifierInput ? identifierInput.value : '';
+    const productId = getTurboProductId();
     const removeTrigger = findTurboRemoveTrigger();
     const canCallAjax = Boolean(
       identifier &&
@@ -360,7 +429,7 @@
         Infusion.Ecomm.OrderForms.ajaxSubmitForm(
           'orderForm',
           false,
-          TURBO_PRODUCT_ID,
+          productId,
           0,
           identifier,
           'RENDER_ORDER_FORM',
@@ -458,6 +527,9 @@
       singleValue: single ? single.radio.value : null,
       singleChecked: single ? single.radio.checked : null
     });
+
+    const productId = getTurboProductId();
+    logDebug('Current Turbo Pack product ID in use:', productId);
     
     if (single) {
       logDebug('Applying price lock to single pay option...');
