@@ -35,6 +35,10 @@
   let turboAddWrapperCache = null;
   let isRemovingTurboPack = false;
   let lastRemovalTime = 0;
+  let lastKnownSingleSelection = null;
+  const FORCED_REMOVAL_COOLDOWN_MS = 5000;
+  let pendingForcedRemovalTimeout = null;
+  let lastForcedRemovalAttempt = 0;
 
   function logDebug() {
     if (!DEBUG) return;
@@ -458,8 +462,9 @@
     return trigger;
   }
 
-  function removeTurboPackFromCart(forceRemove = false) {
-    const inCart = turboPackIsInCart();
+  function removeTurboPackFromCart(forceRemove = false, options = {}) {
+    const precheckedInCart = options.precheckedInCart;
+    const inCart = typeof precheckedInCart === 'boolean' ? precheckedInCart : turboPackIsInCart();
     const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
     
     logDebug('removeTurboPackFromCart called');
@@ -482,7 +487,14 @@
     }
 
     if (!inCart && forceRemove) {
+      const now = Date.now();
+      const sinceLastAttempt = now - lastForcedRemovalAttempt;
+      if (sinceLastAttempt < FORCED_REMOVAL_COOLDOWN_MS) {
+        logDebug('Skipping forced Turbo Pack removal; last attempt was', sinceLastAttempt, 'ms ago');
+        return;
+      }
       logDebug('Turbo Pack not detected in cart, forcing removal attempt via ajax/trigger');
+      lastForcedRemovalAttempt = now;
     }
     
     if (isRemovingTurboPack) {
@@ -495,7 +507,7 @@
     const identifierInput = $('#identifier');
     const identifier = identifierInput ? identifierInput.value : '';
     const productId = getTurboProductId();
-    const removeTrigger = findTurboRemoveTrigger();
+    const removeTrigger = inCart ? findTurboRemoveTrigger() : null;
     const canCallAjax = Boolean(
       identifier &&
       window.Infusion &&
@@ -503,6 +515,11 @@
       Infusion.Ecomm.OrderForms &&
       typeof Infusion.Ecomm.OrderForms.ajaxSubmitForm === 'function'
     );
+
+    if (!inCart) {
+      logDebug('Cart already clean; skipping removal mechanics to avoid refresh');
+      return;
+    }
 
     isRemovingTurboPack = true;
     lastRemovalTime = Date.now();
@@ -544,12 +561,24 @@
   }
 
   function syncTurboPackState(single) {
-    // Check if the single pay radio is actually checked (don't compare objects, check the checked property)
-    const isSingleSelected = Boolean(single && single.radio.checked);
+    const hasSingle = Boolean(single);
+    let isSingleSelected = hasSingle ? Boolean(single.radio.checked) : null;
+
+    if (hasSingle) {
+      lastKnownSingleSelection = isSingleSelected;
+    } else if (lastKnownSingleSelection !== null) {
+      isSingleSelected = lastKnownSingleSelection;
+      logDebug('Using cached single pay selection state because radio is unavailable:', isSingleSelected);
+    }
+
+    if (isSingleSelected === null) {
+      logDebug('Unable to determine single pay selection; leaving upsell visibility unchanged');
+      return;
+    }
 
     logDebug('=== syncTurboPackState called ===');
     logDebug('syncTurboPackState details:', {
-      hasSingle: Boolean(single),
+      hasSingle,
       singleRadioValue: single ? single.radio.value : null,
       singleRadioName: single ? single.radio.name : null,
       singleRadioChecked: single ? single.radio.checked : null,
@@ -561,17 +590,42 @@
     const checkedRadios = allRadios.filter(r => r.checked);
     logDebug(`Currently checked radios (${checkedRadios.length}):`, checkedRadios.map(r => `${r.name}=${r.value}`));
 
-    logDebug(`Setting upsell visibility to: ${!isSingleSelected ? 'VISIBLE' : 'HIDDEN'}`);
-    setUpsellVisibility(!isSingleSelected);
+    const targetVisibility = !isSingleSelected;
+    logDebug(`Setting upsell visibility to: ${targetVisibility ? 'VISIBLE' : 'HIDDEN'}`);
+
+    setUpsellVisibility(targetVisibility);
 
     if (isSingleSelected) {
-      logDebug('✓ Single pay IS selected → Removing Turbo Pack and hiding upsells');
-      // Add a delay to let Keap's AJAX finish updating the cart before we check for Turbo Pack
-      window.setTimeout(() => {
-        logDebug('Delayed Turbo Pack removal check (after 200ms)');
-        removeTurboPackFromCart(true);
-      }, 200);
+      const inCartNow = turboPackIsInCart();
+
+      if (hasSingle) {
+        if (inCartNow) {
+          logDebug('✓ Single pay IS selected and Turbo Pack is in cart → Removing immediately');
+          removeTurboPackFromCart(false, { precheckedInCart: inCartNow });
+        } else {
+          const now = Date.now();
+          const sinceLastAttempt = now - lastForcedRemovalAttempt;
+          if (!pendingForcedRemovalTimeout && sinceLastAttempt > FORCED_REMOVAL_COOLDOWN_MS) {
+            logDebug('Scheduling safety Turbo Pack removal after short delay');
+            pendingForcedRemovalTimeout = window.setTimeout(() => {
+              pendingForcedRemovalTimeout = null;
+              removeTurboPackFromCart(true, { precheckedInCart: inCartNow });
+            }, 200);
+          } else if (pendingForcedRemovalTimeout) {
+            logDebug('Turbo removal already scheduled; awaiting execution');
+          } else {
+            logDebug('Skipping forced Turbo removal; cooldown still active');
+          }
+        }
+      } else {
+        logDebug('Single pay assumed via cached state; skipping removal because radio is unavailable');
+      }
     } else {
+      if (pendingForcedRemovalTimeout) {
+        window.clearTimeout(pendingForcedRemovalTimeout);
+        pendingForcedRemovalTimeout = null;
+        logDebug('Cleared pending Turbo removal because single pay is no longer selected');
+      }
       logDebug('✓ Single pay NOT selected → Showing upsells (Turbo Pack can be added)');
     }
     
