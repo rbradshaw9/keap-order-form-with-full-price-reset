@@ -46,7 +46,9 @@
   function scheduleUpdate(delayMs) {
     if (updateScheduled) return;
     updateScheduled = true;
-    logDebug('scheduleUpdate invoked' + (delayMs ? ' with delay ' + delayMs + 'ms' : ''));
+
+    const hasNumericDelay = typeof delayMs === 'number' && delayMs > 0;
+    logDebug('scheduleUpdate invoked' + (hasNumericDelay ? ' with delay ' + delayMs + 'ms' : ''));
     
     const runUpdate = () => {
       updateScheduled = false;
@@ -54,7 +56,7 @@
       initialize();
     };
     
-    if (delayMs) {
+    if (hasNumericDelay) {
       window.setTimeout(runUpdate, delayMs);
     } else {
       raf(runUpdate);
@@ -264,6 +266,91 @@
     return target.includes(`'${productId}'`) || target.includes(`"${productId}"`);
   }
 
+  function toggleElementVisibility(element, isVisible) {
+    if (!element) return;
+    const attrName = 'data-single-pay-hidden';
+    if (isVisible) {
+      if (element.getAttribute(attrName) === 'true') {
+        element.style.removeProperty('display');
+        element.removeAttribute(attrName);
+      }
+      return;
+    }
+
+    if (element.getAttribute(attrName) !== 'true') {
+      element.setAttribute(attrName, 'true');
+    }
+    element.style.setProperty('display', 'none', 'important');
+  }
+
+  function findTurboHeadingElement(wrapper) {
+    if (!wrapper) return null;
+
+    const headingSelectors = ['h1', 'h2', 'h3', 'h4', '.spiffy-upsell-title', '.upsellHeadline'];
+    for (const selector of headingSelectors) {
+      const directMatch = wrapper.matches && wrapper.matches(selector) ? wrapper : null;
+      const nestedMatch = wrapper.querySelector ? wrapper.querySelector(selector) : null;
+      const candidate = directMatch || nestedMatch;
+      if (candidate && /you might also be interested|turbo pack/i.test(candidate.textContent || '')) {
+        return candidate;
+      }
+    }
+
+    let sibling = wrapper.previousElementSibling;
+    while (sibling) {
+      const text = (sibling.textContent || '').trim();
+      if (text) {
+        if (/you might also be interested/i.test(text)) {
+          return sibling;
+        }
+        break;
+      }
+      sibling = sibling.previousElementSibling;
+    }
+
+    return null;
+  }
+
+  function findTurboAddWrapper() {
+    if (turboAddWrapperCache && document.contains(turboAddWrapperCache)) {
+      return turboAddWrapperCache;
+    }
+
+    turboAddWrapperCache = null;
+
+    const productId = getTurboProductId();
+    if (!productId) return null;
+
+    const roots = [
+      document.getElementById('UP_SELLS'),
+      document.getElementById('content'),
+      document.body
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      const elements = root.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]');
+      for (const el of elements) {
+        const context = ((el.closest('[class*="upsell" i], .spiffy-upsell, .infusion-option, tr, li, div, section, article') || el).textContent || '');
+        const attrTargets = ['href', 'data-href', 'onclick']
+          .map((attr) => el.getAttribute(attr))
+          .filter(Boolean);
+        const matchesProduct = attrTargets.some((target) => targetContainsProductId(target, productId));
+        if (!matchesProduct && !/turbo pack/i.test(context)) {
+          continue;
+        }
+
+        const wrapper = el.closest('[class*="upsell" i], .spiffy-upsell, .spiffy-upsell-wrapper, .infusion-option, tr, li, div, section, article');
+        if (wrapper) {
+          logDebug('Caching Turbo Pack upsell wrapper');
+          turboAddWrapperCache = wrapper;
+          return turboAddWrapperCache;
+        }
+      }
+    }
+
+    return null;
+  }
+
   function isTurboAddButton(element) {
     const text = element.textContent || '';
     if (!/add to order/i.test(text)) return false;
@@ -278,16 +365,28 @@
 
   function findUpsellSections() {
     const sections = [];
-    
-    // Find the entire UP_SELLS section by ID
+
     const upSellRoot = document.getElementById('UP_SELLS');
     if (upSellRoot) {
       sections.push(upSellRoot);
       logDebug('Found UP_SELLS section by ID');
     }
-    
-    logDebug('findUpsellSections found', sections.length, 'section(s)');
-    return sections;
+
+    const turboWrapper = findTurboAddWrapper();
+    if (turboWrapper) {
+      sections.push(turboWrapper);
+      logDebug('Found Turbo Pack wrapper element for visibility control');
+
+      const heading = findTurboHeadingElement(turboWrapper);
+      if (heading) {
+        sections.push(heading);
+        logDebug('Found Turbo Pack heading element for visibility control');
+      }
+    }
+
+    const uniqueSections = sections.filter((section, index, array) => array.indexOf(section) === index);
+    logDebug('findUpsellSections found', uniqueSections.length, 'section(s)');
+    return uniqueSections;
   }
 
   function setUpsellVisibility(isVisible) {
@@ -300,15 +399,7 @@
     }
 
     sections.forEach((section) => {
-      if (isVisible) {
-        // Show the element - remove display:none if present
-        if (section.style.display === 'none') {
-          section.style.display = '';
-        }
-      } else {
-        // Hide the element
-        section.style.display = 'none';
-      }
+      toggleElementVisibility(section, isVisible);
     });
   }
 
@@ -435,9 +526,13 @@
           'RENDER_ORDER_FORM',
           TURBO_UPDATE_TARGETS.slice()
         );
+        turboAddWrapperCache = null;
+        scheduleUpdate(300);
       } else if (removeTrigger) {
         logDebug('Falling back to remove trigger click');
         removeTrigger.click();
+        turboAddWrapperCache = null;
+        scheduleUpdate(300);
       } else {
         logDebug('ERROR: No way to remove Turbo Pack found');
       }
@@ -560,6 +655,10 @@
       return false;
     }
 
+    if (turboAddWrapperCache && !document.contains(turboAddWrapperCache)) {
+      turboAddWrapperCache = null;
+    }
+
     if (mutation.type === 'childList') {
       const changedNodes = [
         ...Array.from(mutation.addedNodes || []),
@@ -572,6 +671,8 @@
         if (node.querySelector && node.querySelector('input[type="radio"]')) return true;
         // Also react to cart/product list changes (for Turbo Pack detection)
         if (node.id === 'ORDER_FORM_PRODUCT_LIST' || node.closest('#ORDER_FORM_PRODUCT_LIST')) return true;
+        if (node.id === 'UP_SELLS' || node.closest('#UP_SELLS')) return true;
+        if (/turbo pack/i.test(node.textContent || '')) return true;
         return false;
       });
       
