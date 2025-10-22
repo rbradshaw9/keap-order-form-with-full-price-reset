@@ -9,7 +9,7 @@
     SINGLE_PAY_VALUES: ['0']
   };
 
-  const TURBO_PRODUCT_ID = '5';  // Updated to correct product ID
+  const TURBO_PRODUCT_ID = '8';  // Turbo Pack product ID from view-source
   const TURBO_UPDATE_TARGETS = [
     'ORDER_FORM_PRODUCT_LIST',
     'ORDER_FORM_BILLING_ENTRY',
@@ -41,15 +41,22 @@
     console.log.apply(console, args);
   }
 
-  function scheduleUpdate() {
+  function scheduleUpdate(delayMs) {
     if (updateScheduled) return;
     updateScheduled = true;
-    logDebug('scheduleUpdate invoked');
-    raf(() => {
+    logDebug('scheduleUpdate invoked' + (delayMs ? ' with delay ' + delayMs + 'ms' : ''));
+    
+    const runUpdate = () => {
       updateScheduled = false;
       logDebug('scheduleUpdate running initialize');
       initialize();
-    });
+    };
+    
+    if (delayMs) {
+      window.setTimeout(runUpdate, delayMs);
+    } else {
+      raf(runUpdate);
+    }
   }
 
 
@@ -391,7 +398,11 @@
 
     if (isSingleSelected) {
       logDebug('✓ Single pay IS selected → Removing Turbo Pack and hiding upsells');
-      removeTurboPackFromCart();
+      // Add a delay to let Keap's AJAX finish updating the cart before we check for Turbo Pack
+      window.setTimeout(() => {
+        logDebug('Delayed Turbo Pack removal check (after 200ms)');
+        removeTurboPackFromCart();
+      }, 200);
     } else {
       logDebug('✓ Single pay NOT selected → Showing upsells (Turbo Pack can be added)');
     }
@@ -480,13 +491,16 @@
       ];
       const shouldReact = changedNodes.some((node) => {
         if (!(node instanceof Element)) return false;
+        // React to radio button changes
         if (node.matches('input[type="radio"]')) return true;
         if (node.querySelector && node.querySelector('input[type="radio"]')) return true;
+        // Also react to cart/product list changes (for Turbo Pack detection)
+        if (node.id === 'ORDER_FORM_PRODUCT_LIST' || node.closest('#ORDER_FORM_PRODUCT_LIST')) return true;
         return false;
       });
       
       if (shouldReact) {
-        logDebug('📡 Mutation detected: childList change affecting radio buttons');
+        logDebug('📡 Mutation detected: childList change affecting radio buttons or product list');
       }
       return shouldReact;
     }
@@ -512,7 +526,8 @@
   if (MutationObserverCtor && targetNode) {
     const observer = new MutationObserverCtor((mutations) => {
       if (mutations.some(shouldReactToMutation)) {
-        scheduleUpdate();
+        // Add a delay to allow DOM to fully settle after Keap's AJAX updates
+        scheduleUpdate(100);
       }
     });
     observer.observe(targetNode, { childList: true, subtree: true, attributes: true, attributeFilter: ['checked'] });
