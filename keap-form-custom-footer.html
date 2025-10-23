@@ -287,6 +287,13 @@
     element.style.setProperty('display', 'none', 'important');
   }
 
+  function findSpiffyBumpElements() {
+    const container = document.querySelector('.spiffyBumpContainer');
+    const checkbox = document.getElementById('bumpStatus');
+    const label = checkbox ? checkbox.closest('label') : (container ? container.querySelector('.bumpTitle') : null);
+    return { container, checkbox, label };
+  }
+
   function findTurboHeadingElement(wrapper) {
     if (!wrapper) return null;
 
@@ -388,6 +395,16 @@
       }
     }
 
+    const { container: spiffyContainer, label: spiffyLabel } = findSpiffyBumpElements();
+    if (spiffyContainer) {
+      sections.push(spiffyContainer);
+      logDebug('Found Spiffy bump container for visibility control');
+    }
+    if (spiffyLabel) {
+      sections.push(spiffyLabel);
+      logDebug('Found Spiffy bump label for visibility control');
+    }
+
     const uniqueSections = sections.filter((section, index, array) => array.indexOf(section) === index);
     logDebug('findUpsellSections found', uniqueSections.length, 'section(s)');
     return uniqueSections;
@@ -460,6 +477,75 @@
       logDebug('findTurboRemoveTrigger: No remove link found for product ID', productId);
     }
     return trigger;
+  }
+
+  function findTurboSummaryRow() {
+    const productList = document.getElementById('ORDER_FORM_PRODUCT_LIST');
+    if (!productList) {
+      return null;
+    }
+
+    const productId = getTurboProductId();
+    return Array.from(productList.querySelectorAll('tr')).find((row) => {
+      const text = row.textContent || '';
+      if (/turbo pack/i.test(text)) {
+        return true;
+      }
+
+      const links = row.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]');
+      return Array.from(links).some((link) => {
+        const candidates = ['href', 'data-href', 'onclick']
+          .map((attr) => link.getAttribute(attr))
+          .filter(Boolean);
+        return candidates.some((target) => targetContainsProductId(target, productId));
+      });
+    }) || null;
+  }
+
+  function ensureTurboSummaryRowVisible() {
+    const row = findTurboSummaryRow();
+    if (!row) {
+      return;
+    }
+
+    if (row.style.display === 'none') {
+      logDebug('Making Turbo Pack summary row visible');
+      row.style.removeProperty('display');
+    }
+  }
+
+  function hideTurboRemoveLink() {
+    const row = findTurboSummaryRow();
+    if (!row) {
+      return;
+    }
+
+    const productId = getTurboProductId();
+    const links = Array.from(row.querySelectorAll('a[href*="ajaxSubmitForm"], button[href*="ajaxSubmitForm"], button[data-href*="ajaxSubmitForm"]'));
+
+    links.forEach((link) => {
+      const text = (link.textContent || '').trim();
+      if (!/remove/i.test(text)) {
+        return;
+      }
+
+      if (link.getAttribute('data-single-pay-hidden') === 'true') {
+        return;
+      }
+
+      const candidates = ['href', 'data-href', 'onclick']
+        .map((attr) => link.getAttribute(attr))
+        .filter(Boolean);
+      const targetsTurboPack = candidates.some((target) => targetContainsProductId(target, productId));
+      if (!targetsTurboPack) {
+        return;
+      }
+
+      logDebug('Hiding Turbo Pack remove link in order summary');
+      link.setAttribute('data-single-pay-hidden', 'true');
+      link.style.setProperty('display', 'none', 'important');
+      link.setAttribute('aria-hidden', 'true');
+    });
   }
 
   function removeTurboPackFromCart(forceRemove = false, options = {}) {
@@ -594,6 +680,13 @@
     logDebug(`Setting upsell visibility to: ${targetVisibility ? 'VISIBLE' : 'HIDDEN'}`);
 
     setUpsellVisibility(targetVisibility);
+    syncSpiffyBumpAvailability(isSingleSelected);
+
+    if (!isSingleSelected) {
+      ensureTurboSummaryRowVisible();
+    }
+
+    hideTurboRemoveLink();
 
     if (isSingleSelected) {
       const inCartNow = turboPackIsInCart();
@@ -630,6 +723,53 @@
     }
     
     logDebug('=== syncTurboPackState complete ===');
+  }
+
+  function syncSpiffyBumpAvailability(isSingleSelected) {
+    const { container, checkbox } = findSpiffyBumpElements();
+    if (!container && !checkbox) {
+      return;
+    }
+
+    logDebug('Syncing Spiffy bump state', {
+      hasContainer: Boolean(container),
+      hasCheckbox: Boolean(checkbox),
+      isSingleSelected
+    });
+
+    if (container) {
+      container.setAttribute('aria-hidden', isSingleSelected ? 'true' : 'false');
+    }
+
+    if (!checkbox) {
+      return;
+    }
+
+    const DISABLED_ATTR = 'data-single-pay-disabled';
+
+    if (isSingleSelected) {
+      checkbox.disabled = true;
+      checkbox.setAttribute(DISABLED_ATTR, 'true');
+
+      if (checkbox.checked) {
+        logDebug('Unchecking Spiffy bump checkbox because single pay is selected');
+        checkbox.checked = false;
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (typeof window.spiffyIsUpsellAdded === 'function' && typeof window.spiffyRemoveBump === 'function' && window.spiffyIsUpsellAdded()) {
+        logDebug('Ensuring Spiffy bump upsell is removed via spiffyRemoveBump');
+        try {
+          window.spiffyRemoveBump();
+        } catch (error) {
+          console.error('spiffyRemoveBump invocation failed', error);
+        }
+      }
+    } else {
+      if (checkbox.getAttribute(DISABLED_ATTR) === 'true') {
+        checkbox.removeAttribute(DISABLED_ATTR);
+      }
+      checkbox.disabled = false;
+      ensureTurboSummaryRowVisible();
+    }
   }
 
   function onRadioChange() {
@@ -726,6 +866,8 @@
         // Also react to cart/product list changes (for Turbo Pack detection)
         if (node.id === 'ORDER_FORM_PRODUCT_LIST' || node.closest('#ORDER_FORM_PRODUCT_LIST')) return true;
         if (node.id === 'UP_SELLS' || node.closest('#UP_SELLS')) return true;
+        if (node.id === 'bumpStatus' || (node.matches && node.matches('.spiffyBumpContainer'))) return true;
+        if (node.querySelector && (node.querySelector('#bumpStatus') || node.querySelector('.spiffyBumpContainer'))) return true;
         if (/turbo pack/i.test(node.textContent || '')) return true;
         return false;
       });
@@ -737,7 +879,7 @@
     }
 
     if (mutation.type === 'attributes' && mutation.target instanceof Element) {
-      const shouldReact = mutation.target.matches('input[type="radio"]');
+      const shouldReact = mutation.target.matches('input[type="radio"]') || mutation.target.id === 'bumpStatus';
       if (shouldReact) {
         logDebug('📡 Mutation detected: radio button attribute changed', {
           target: mutation.target,
